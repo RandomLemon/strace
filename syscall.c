@@ -30,20 +30,23 @@
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-
 #include "defs.h"
 #include "native_defs.h"
 #include "nsig.h"
 #include <sys/param.h>
-
+#include <sys/types.h>
+#include <sys/wait.h>
 /* for struct iovec */
 #include <sys/uio.h>
+#include <search.h>
 
 /* for __X32_SYSCALL_BIT */
 #include <asm/unistd.h>
 
 #include "regs.h"
 #include "ptrace.h"
+#include "setup_kcov.c"
+
 
 #if defined(SPARC64)
 # undef PTRACE_GETREGS
@@ -562,6 +565,7 @@ static int arch_set_scno(struct tcb *, kernel_ulong_t);
 static void get_error(struct tcb *, const bool);
 static int arch_set_error(struct tcb *);
 static int arch_set_success(struct tcb *);
+static unsigned long setup_kcov(pid_t, pid_t, unsigned long, int *);
 
 struct inject_opts *inject_vec[SUPPORTED_PERSONALITIES];
 
@@ -572,7 +576,20 @@ tcb_inject_opts(struct tcb *tcp)
 	       ? &tcp->inject_vec[current_personality][tcp->scno] : NULL;
 }
 
+unsigned long get_pos(struct tcb *tcp) {
+	int n;
 
+
+	if (!tcp->kcov_meta.mmap_area)
+		return -1;
+
+	if (tcp->kcov_meta.is_main_tracee)
+		return __atomic_load_n((unsigned long *)tcp->kcov_meta.mmap_area, __ATOMIC_RELAXED);
+	if ((n = ptrace(PTRACE_PEEKDATA, tcp->pid, tcp->kcov_meta.mmap_area, NULL)) < 0) {
+		perror("PTRACE_PEEKDATA");
+	}
+    return n;
+}
 static long
 tamper_with_syscall_entering(struct tcb *tcp, unsigned int *signo)
 {
@@ -637,12 +654,13 @@ tamper_with_syscall_exiting(struct tcb *tcp)
 	return 0;
 }
 
+
 static int
 trace_syscall_entering(struct tcb *tcp, unsigned int *sig)
 {
 	int res, scno_good;
 
-	scno_good = res = get_scno(tcp);
+    scno_good = res = get_scno(tcp);
 	if (res == 0)
 		return res;
 	if (res == 1)
@@ -655,8 +673,14 @@ trace_syscall_entering(struct tcb *tcp, unsigned int *sig)
 		 * " <unavailable>" will be added later by the code which
 		 * detects ptrace errors.
 		 */
+
 		goto ret;
 	}
+
+
+    if (Tflag || cflag)
+        gettimeofday(&tcp->etime, NULL);
+
 
 #ifdef LINUX_MIPSO32
 	if (SEN_syscall == tcp->s_ent->sen)
@@ -730,13 +754,21 @@ trace_syscall_entering(struct tcb *tcp, unsigned int *sig)
 	else
 		res = tcp->s_ent->sys_func(tcp);
 
+
 	fflush(tcp->outf);
  ret:
+
+	/* Measure the entrance time as late as possible to avoid errors. */
+	if (kcov_enabled) {
+		int n = get_pos(tcp);
+
+		tcp->kcov_meta.buf_pos = (n >= 0) ? n: 0;
+	}
 	tcp->flags |= TCB_INSYSCALL;
 	tcp->sys_func_rval = res;
-	/* Measure the entrance time as late as possible to avoid errors. */
 	if (Tflag || cflag)
 		gettimeofday(&tcp->etime, NULL);
+    //fprintf(stderr, "finished tracing enter\n");
 	return res;
 }
 
@@ -745,6 +777,126 @@ syscall_tampered(struct tcb *tcp)
 {
 	return tcp->flags & TCB_TAMPERED;
 }
+
+int kcov_compare_func(const void *l, const void *r) {
+	const struct kcov_tsearch_entry *ml = l;
+	const struct kcov_tsearch_entry *mr = r;
+
+	if (ml->k < mr->k)
+		return -1;
+	else if (ml->k > mr->k)
+		return 1;
+	return 0;
+}
+
+struct kcov_tsearch_entry *make_entry(unsigned long ip) {
+	struct kcov_tsearch_entry *e;
+
+	e = (struct kcov_tsearch_entry*) calloc(sizeof(struct kcov_tsearch_entry), 0);
+	if (!e) {
+		printf("out of memory\n");
+		exit(EXIT_FAILURE);
+	}
+
+	e->k = ip;
+	e->v = "";
+    return e;
+}
+
+void kcov_free_func(void *mt_data) {
+	struct kcov_tsearch_entry *m = mt_data;
+	if(!m) {
+		return;
+	}
+	free(m);
+	return;
+}
+
+
+int cover_buf_flush(struct tcb *tcp) {
+	unsigned long cover_addr;
+	unsigned long ip;
+	int i, j;
+	long n;
+	pid_t pid;
+	void *tree = 0;
+	struct kcov_tsearch_entry *e = 0;
+
+    pid = tcp->pid;
+	i = j = tcp->kcov_meta.buf_pos;
+	cover_addr = tcp->kcov_meta.mmap_area;
+
+	if (tcp->kcov_meta.is_main_tracee) {
+		n = __atomic_load_n((unsigned long *)cover_addr, __ATOMIC_RELAXED);
+	} else if ((n = ptrace(PTRACE_PEEKDATA, pid, cover_addr, NULL)) < 0) {
+		perror("PTRACE_PEEKDATA");
+		return -1;
+	}
+
+	tprintf("\"Cover: ");
+
+	while(i < n) {
+		void *t = 0;
+		if (!tcp->kcov_meta.is_main_tracee) {
+			ip = ptrace(PTRACE_PEEKDATA, pid, cover_addr + (i+1)*sizeof(unsigned long), NULL);
+		}
+		else {
+			ip = ((unsigned long *)cover_addr)[i+1];
+		}
+		e = make_entry(ip);
+		if (!(t = tsearch(e, &tree, kcov_compare_func)))
+			exit(EXIT_FAILURE);
+        struct kcov_tsearch_entry *ret = *(struct kcov_tsearch_entry **)t;
+		if (ret == e) {
+			//We have a new entry;
+			if (i > j)
+				tprintf(",");
+			tprintf("0x%lx", ip);
+		} else {
+            free(e);
+        }
+		i++;
+	}
+	tprintf("\"\n");
+	if (tcp->kcov_meta.is_main_tracee) {
+		__atomic_store_n((unsigned long *)cover_addr, 0, __ATOMIC_RELAXED);
+		tcp->kcov_meta.buf_pos = 0;
+	} else {
+		tcp->kcov_meta.buf_pos = n;
+	}
+	tdestroy(tree, kcov_free_func);
+    return 0;
+}
+
+static void
+prepare_kcov(struct tcb *tcp)
+{
+	if (tcp->kcov_meta.after_exec) {
+		tcp->kcov_meta.mmap_area = setup_kcov(tcp->pid, 0, 0, &tcp->kcov_meta.fd);
+		tcp->kcov_meta.after_exec = 0;
+	} else {
+		//We need to free our parent's cover buffer
+		tcp->kcov_meta.fd = 0;
+		tcp->kcov_meta.mmap_area = setup_kcov(tcp->pid,
+											  tcp->kcov_meta.parent,
+											  tcp->kcov_meta.parent_addr,
+											  &tcp->kcov_meta.fd);
+	}
+}
+
+static void
+handle_kcov(struct tcb *tcp)
+{
+    if (!tcp->kcov_meta.need_setup) {
+        if (cover_buf_flush(tcp) < 0) {
+            fprintf(stderr, "ERROR FLUSHING BUFFER\n");
+        }
+    } else {
+		prepare_kcov(tcp);
+		tcp->kcov_meta.need_setup = 0;
+	}
+}
+
 
 static int
 trace_syscall_exiting(struct tcb *tcp)
@@ -976,6 +1128,8 @@ trace_syscall_exiting(struct tcb *tcp)
 	tprints("\n");
 	dumpio(tcp);
 	line_ended();
+	//Dump kcov info
+
 
 #ifdef USE_LIBUNWIND
 	if (stack_trace_enabled)
@@ -983,6 +1137,20 @@ trace_syscall_exiting(struct tcb *tcp)
 #endif
 
  ret:
+    if (kcov_enabled) {
+        if (tcp->s_ent->sen == SEN_execve &&
+            !tcp->kcov_meta.is_main_tracee) {
+            //On exxc the cover buffers of the child disappear so we have
+            //to setupkcov again
+            tcp->kcov_meta.need_setup = 1;
+            tcp->kcov_meta.after_exec = 1;
+            tcp->kcov_meta.update_proc_meta = 1;
+            tcp->kcov_meta.mmap_area = 0;
+        } else {
+            handle_kcov(tcp);
+        }
+
+    }
 	tcp->flags &= ~(TCB_INSYSCALL | TCB_TAMPERED);
 	tcp->sys_func_rval = 0;
 	free_tcb_priv_data(tcp);
@@ -1201,6 +1369,8 @@ struct sysent_buf {
 	struct_sysent ent;
 	char buf[sizeof("syscall_%lu") + sizeof(kernel_ulong_t) * 3];
 };
+
+
 
 static void
 free_sysent_buf(void *ptr)

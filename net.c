@@ -90,6 +90,7 @@
 void
 print_ifindex(unsigned int ifindex)
 {
+/*
 #ifdef HAVE_IF_INDEXTONAME
 	char buf[IFNAMSIZ + 1];
 
@@ -100,6 +101,7 @@ print_ifindex(unsigned int ifindex)
 		return;
 	}
 #endif
+*/
 	tprintf("%u", ifindex);
 }
 
@@ -262,7 +264,7 @@ SYS_FUNC(sendto)
 {
 	printfd(tcp, tcp->u_arg[0]);
 	tprints(", ");
-	decode_sockbuf(tcp, tcp->u_arg[0], tcp->u_arg[1], tcp->u_arg[2]);
+	printstrn(tcp, tcp->u_arg[1], tcp->u_arg[2]);
 	tprintf(", %" PRI_klu ", ", tcp->u_arg[2]);
 	/* flags */
 	printflags(msg_flags, tcp->u_arg[3], "MSG_???");

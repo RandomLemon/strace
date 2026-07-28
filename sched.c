@@ -30,7 +30,8 @@
 #include "defs.h"
 
 #include <sched.h>
-#include "sched_attr.h"
+// #include "sched_attr.h"
+# define SCHED_ATTR_MIN_SIZE	48
 
 #include "xlat/schedulers.h"
 #include "xlat/sched_flags.h"

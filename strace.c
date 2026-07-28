@@ -36,10 +36,15 @@
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <string.h>
 #include <pwd.h>
 #include <grp.h>
 #include <dirent.h>
 #include <sys/utsname.h>
+#include <string.h>
 #ifdef HAVE_PRCTL
 # include <sys/prctl.h>
 #endif
@@ -74,6 +79,8 @@ const unsigned int syscall_trap_sig = SIGTRAP | 0x80;
 
 cflag_t cflag = CFLAG_NONE;
 unsigned int followfork = 0;
+unsigned int kcov_enabled = 0;
+unsigned long *main_tracee_cover = NULL;
 unsigned int ptrace_setoptions = PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEEXEC
 				 | PTRACE_O_TRACEEXIT;
 unsigned int xflag = 0;
@@ -740,6 +747,9 @@ alloctcb(int pid)
 		if (!tcp->pid) {
 			memset(tcp, 0, sizeof(*tcp));
 			tcp->pid = pid;
+            tcp->kcov_meta.parent_addr = 0;
+            tcp->kcov_meta.parent = 0;
+            tcp->kcov_meta.mmap_area = 0;
 #if SUPPORTED_PERSONALITIES > 1
 			tcp->currpers = current_personality;
 #endif
@@ -1301,7 +1311,7 @@ startup_child(char **argv)
 	const char *filename;
 	size_t filename_len;
 	char pathname[PATH_MAX];
-	int pid;
+	int pid, kcov_fd;
 	struct tcb *tcp;
 
 	filename = argv[0];
@@ -1375,7 +1385,21 @@ startup_child(char **argv)
 	 * It's hard to know when that happens, so we just leak it.
 	 */
 	params_for_tracee.pathname = NOMMU_SYSTEM ? xstrdup(pathname) : pathname;
-
+	if (kcov_enabled) {
+		kcov_fd = open("/sys/kernel/debug/kcov", O_RDWR);
+		if (kcov_fd == -1)
+			perror_msg_and_die("open");
+		if (ioctl(kcov_fd, KCOV_INIT_TRACE, COVER_SIZE))
+			perror_msg_and_die("ioctl");
+		main_tracee_cover = (unsigned long *) mmap(NULL,
+							COVER_SIZE * sizeof(unsigned long),
+							PROT_READ | PROT_WRITE,
+							MAP_SHARED,
+							kcov_fd,
+							0);
+		if ((void *)main_tracee_cover == MAP_FAILED)
+			perror_msg_and_die("mmap");
+	}
 #if defined HAVE_PRCTL && defined PR_SET_PTRACER && defined PR_SET_PTRACER_ANY
 	if (daemonized_tracer)
 		prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY);
@@ -1392,6 +1416,11 @@ startup_child(char **argv)
 		 * -D: we are parent
 		 * not -D: we are child
 		 */
+		if (kcov_enabled) {
+			if (ioctl(kcov_fd, KCOV_ENABLE, 0))
+				perror_msg_and_die("ioctl");
+		}
+
 		exec_or_die();
 	}
 
@@ -1433,6 +1462,10 @@ startup_child(char **argv)
 		tcp->flags |= TCB_ATTACHED | TCB_STARTUP
 			    | TCB_SKIP_DETACH_ON_FIRST_EXEC
 			    | (NOMMU_SYSTEM ? 0 : (TCB_HIDE_LOG | post_attach_sigstop));
+		if (kcov_enabled) {
+			tcp->kcov_meta.mmap_area = (unsigned long) main_tracee_cover;
+			tcp->kcov_meta.is_main_tracee = 1;
+		}
 		newoutf(tcp);
 	}
 	else {
@@ -1606,7 +1639,7 @@ init(int argc, char *argv[])
 #endif
 	qualify("signal=all");
 	while ((c = getopt(argc, argv,
-		"+b:cCdfFhiqrtTvVwxyz"
+		"+b:cCdkfFhiqrtTvVwxyz"
 #ifdef USE_LIBUNWIND
 		"k"
 #endif
@@ -1645,6 +1678,9 @@ init(int argc, char *argv[])
 			break;
 		case 'h':
 			usage();
+			break;
+		case 'k':
+			kcov_enabled=1;
 			break;
 		case 'i':
 			iflag = 1;
@@ -1735,6 +1771,7 @@ init(int argc, char *argv[])
 		}
 	}
 	argv += optind;
+	printf("KCOV ENABLED: %u\n", kcov_enabled);
 	/* argc -= optind; - no need, argc is not used below */
 
 	acolumn_spaces = xmalloc(acolumn + 1);
@@ -1925,6 +1962,7 @@ init(int argc, char *argv[])
 	print_pid_pfx = (outfname && followfork < 2 && (followfork == 1 || nprocs > 1));
 }
 
+
 static struct tcb *
 pid2tcb(int pid)
 {
@@ -1940,6 +1978,37 @@ pid2tcb(int pid)
 	}
 
 	return NULL;
+}
+
+
+static void
+set_process_metadata(struct tcb *tcp)
+{
+    struct tcb *parent_tcp;
+    char buffer[BUFSIZ];
+    sprintf(buffer, "/proc/%d/stat", tcp->pid);
+    FILE* fp = fopen(buffer, "r");
+    if (fp) {
+        size_t size = fread(buffer, sizeof (char), sizeof (buffer), fp);
+        if (size > 0) {
+            // See: http://man7.org/linux/man-pages/man5/proc.5.html section /proc/[pid]/stat
+            strtok(buffer, " "); // (1) pid  %d
+            char *comm = strtok(NULL, " "); // (2) comm  %s
+            //fprintf(stderr, "process name: %s\n", comm);
+            strncpy(tcp->kcov_meta.comm, comm, MAX_COMM_LEN);
+            char * state = strtok(NULL, " "); // (3) state  %c
+            char * s_ppid = strtok(NULL, " "); // (4) ppid  %d
+			tcp->kcov_meta.parent = atoi(s_ppid);
+			//fprintf(stderr, "parent name: %d\n", tcp->kcov_meta.parent);
+            if ((parent_tcp = pid2tcb(tcp->kcov_meta.parent))) {
+                if (parent_tcp->kcov_meta.is_main_tracee) {
+                    tcp->kcov_meta.parent = 0;
+                    tcp->kcov_meta.parent_addr = 0;
+                }
+            }
+        }
+        fclose(fp);
+    }
 }
 
 static void
@@ -2041,8 +2110,15 @@ maybe_allocate_tcb(const int pid, int status)
 	}
 	if (followfork) {
 		/* We assume it's a fork/vfork/clone child */
+
 		struct tcb *tcp = alloctcb(pid);
-		tcp->flags |= TCB_ATTACHED | TCB_STARTUP | post_attach_sigstop;
+        tcp->flags |= TCB_ATTACHED | TCB_STARTUP | post_attach_sigstop;
+
+        set_process_metadata(tcp);
+
+		tcp->kcov_meta.is_main_tracee = false;
+		tcp->kcov_meta.need_setup = 1;
+		tcp->kcov_meta.buf_pos = 0;
 		newoutf(tcp);
 		if (!qflag)
 			error_msg("Process %d attached", pid);
@@ -2318,6 +2394,11 @@ trace(void)
 		 * PTRACE_GETEVENTMSG returns old pid starting from Linux 3.0.
 		 * On 2.6 and earlier, it can return garbage.
 		 */
+		if (kcov_enabled) {
+			if (tcp->kcov_meta.is_main_tracee) {
+				//Need to update the process metadata
+			}
+		}
 		if (os_release >= KERNEL_VERSION(3,0,0))
 			tcp = maybe_switch_tcbs(tcp, pid);
 
@@ -2456,6 +2537,10 @@ show_stopsig:
 	 * Handle it.
 	 */
 	sig = 0;
+    if (kcov_enabled) {
+        if (tcp->kcov_meta.update_proc_meta)
+            set_process_metadata(tcp);
+    }
 	if (trace_syscall(tcp, &sig) < 0) {
 		/*
 		 * ptrace() failed in trace_syscall().

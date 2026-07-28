@@ -31,6 +31,7 @@
 #include "defs.h"
 #include <linux/ioctl.h>
 #include "xlat/ioctl_dirs.h"
+#include "nvidia_ioctl.h"
 
 #ifdef HAVE_LINUX_INPUT_H
 # include <linux/input.h>
@@ -259,6 +260,8 @@ ioctl_decode(struct tcb *tcp)
 		return scsi_ioctl(tcp, code, arg);
 	case 'L':
 		return loop_ioctl(tcp, code, arg);
+	case 'F':
+		return nvidia_ioctl(tcp, code, arg);
 	case 'M':
 		return mtd_ioctl(tcp, code, arg);
 	case 'o':

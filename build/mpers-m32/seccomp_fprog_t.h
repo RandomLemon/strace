@@ -1,0 +1,8 @@
+#include <inttypes.h>
+typedef
+struct {
+uint16_t len;
+unsigned char mpers_filler_1[2];
+uint32_t filter;
+} ATTRIBUTE_PACKED m32_seccomp_fprog_t;
+#define MPERS_m32_seccomp_fprog_t m32_seccomp_fprog_t

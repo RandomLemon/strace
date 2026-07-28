@@ -173,6 +173,8 @@ strace_SOURCES =	\
 	netlink.c       \
 	nsig.h		\
 	numa.c		\
+	nvidia_ioctl.c	\
+	nvidia_ioctl.h	\
 	oldstat.c	\
 	open.c		\
 	or1k_atomic.c	\
